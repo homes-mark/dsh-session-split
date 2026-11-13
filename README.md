@@ -4,11 +4,13 @@
 
 ## 安装
 
-1. 下载或克隆本仓库：`git clone https://github.com/homes-mark/dsh-session-split.git`
-2. 在 DSH 中打开 **Plugins → Add plugin**。
-3. 选择本仓库目录，安装并启用 **“会话分屏”**。
+1. 在 DSH 中打开 **Plugins → Add plugin**。
+2. 输入仓库地址 **`https://github.com/homes-mark/dsh-session-split`**，点击安装。
+3. 安装完成后启用 **“会话分屏”**。
 
-本仓库提供源码，安装到当前 DSH profile 后生效；不需要额外构建，也不需要配置模型或工作区。
+安装到当前 DSH profile 后生效；不需要先下载或 clone，也不需要额外构建、配置模型或配置工作区。
+
+如果希望手动修改源码，也可以先运行 `git clone https://github.com/homes-mark/dsh-session-split.git`，再在上述安装窗口中输入本地仓库目录路径。
 
 ## 使用
 
