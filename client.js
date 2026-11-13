@@ -4,6 +4,141 @@ window.__ModuleLoader__.load({
     const React = require('react');
     const h = React.createElement;
 
+    /**
+     * Compatibility adapter for DSH 0.2.2-rc.2's public Session-status observable.
+     * There is no native completion acknowledgement API in that release. Decorate
+     * only getSnapshot/subscribe: never touch private state, mainView or selection.
+     * Install before React mounts (refresh the page after installation/upgrades).
+     */
+    function createCompletionReadBridge(source, reportError = () => {}) {
+      if (!source || typeof source.getSnapshot !== 'function' || typeof source.subscribe !== 'function') {
+        throw new Error('[session-split] This DSH version has no compatible Session status observable');
+      }
+      const getDescriptor = Object.getOwnPropertyDescriptor(source, 'getSnapshot');
+      const subscribeDescriptor = Object.getOwnPropertyDescriptor(source, 'subscribe');
+      if (!getDescriptor?.configurable || !subscribeDescriptor?.configurable
+        || typeof getDescriptor.value !== 'function' || typeof subscribeDescriptor.value !== 'function') {
+        throw new Error('[session-split] Session status methods cannot be safely decorated');
+      }
+      const originalGet = getDescriptor.value;
+      const originalSubscribe = subscribeDescriptor.value;
+      const initial = originalGet.call(source);
+      if (!(initial instanceof Map)) {
+        throw new Error('[session-split] Unsupported Session status snapshot');
+      }
+
+      const visible = new Map();
+      const acknowledged = new Set();
+      const listeners = new Set();
+      let active = true;
+      let lastRaw;
+      let lastAcknowledged = new Set();
+      let snapshot = initial;
+
+      function refresh() {
+        const raw = originalGet.call(source);
+        // An acknowledgement belongs to this completion cycle only. A new run,
+        // native acknowledgement, or removal must restore normal reminder behavior.
+        for (const id of acknowledged) {
+          const status = raw.get(id);
+          if (!status || status.running === true || status.completionUnread !== true) acknowledged.delete(id);
+        }
+        for (const id of visible.keys()) {
+          const status = raw.get(id);
+          if (status?.completionUnread === true && status.running !== true) acknowledged.add(id);
+        }
+        const sameAcknowledged = acknowledged.size === lastAcknowledged.size
+          && [...acknowledged].every(id => lastAcknowledged.has(id));
+        if (raw === lastRaw && sameAcknowledged) return snapshot;
+        lastRaw = raw;
+        lastAcknowledged = new Set(acknowledged);
+        // Return the original snapshot and unchanged status records whenever possible.
+        snapshot = acknowledged.size === 0 ? raw : new Map(raw);
+        for (const id of acknowledged) {
+          snapshot.set(id, { ...raw.get(id), completionUnread: false });
+        }
+        return snapshot;
+      }
+
+      // useSyncExternalStore requires a side-effect-free, stable snapshot getter.
+      function read() {
+        return active ? snapshot : originalGet.call(source);
+      }
+
+      function notify() {
+        for (const { listener } of [...listeners]) {
+          try { listener(); } catch (error) { reportError(error); }
+        }
+      }
+
+      function subscribe(listener) {
+        // Every consumer remains directly subscribed to the original source. This
+        // subscription survives adapter disposal until the consumer itself releases it.
+        // The native source deduplicates callbacks in a Set. Give every subscription
+        // a distinct callback so releasing one cannot detach another identical listener.
+        const nativeListener = () => listener();
+        const unsubscribe = originalSubscribe.call(source, nativeListener);
+        if (!active) return unsubscribe;
+        const record = { listener };
+        listeners.add(record);
+        let held = true;
+        return () => {
+          if (!held) return;
+          held = false;
+          listeners.delete(record);
+          unsubscribe();
+        };
+      }
+
+      refresh();
+      // Observe every native transition even if the sidebar is temporarily unmounted.
+      // Installed before React mounts, this observer refreshes before UI listeners.
+      // Native notifications already reach every subscriber; do not broadcast twice.
+      const unsubscribeWatch = originalSubscribe.call(source, () => { if (active) refresh(); });
+      try {
+        Object.defineProperty(source, 'getSnapshot', { ...getDescriptor, value: read });
+        Object.defineProperty(source, 'subscribe', { ...subscribeDescriptor, value: subscribe });
+      } catch (error) {
+        if (source.getSnapshot === read) Object.defineProperty(source, 'getSnapshot', getDescriptor);
+        unsubscribeWatch();
+        throw error;
+      }
+
+      return {
+        retainVisible(sessionId) {
+          if (!active || !sessionId) return () => {};
+          const before = snapshot;
+          visible.set(sessionId, (visible.get(sessionId) || 0) + 1);
+          refresh();
+          if (snapshot !== before) notify();
+          let held = true;
+          return () => {
+            if (!held || !active) return;
+            held = false;
+            const count = visible.get(sessionId) || 0;
+            if (count > 1) visible.set(sessionId, count - 1);
+            else visible.delete(sessionId);
+            // Keep this cycle's acknowledgement after hiding; it was already seen.
+          };
+        },
+        dispose() {
+          if (!active) return;
+          active = false;
+          unsubscribeWatch();
+          // Never overwrite a decorator another plugin installed after ours.
+          if (source.getSnapshot === read) Object.defineProperty(source, 'getSnapshot', getDescriptor);
+          if (source.subscribe === subscribe) Object.defineProperty(source, 'subscribe', subscribeDescriptor);
+          visible.clear();
+          acknowledged.clear();
+          lastAcknowledged.clear();
+          lastRaw = undefined;
+          snapshot = undefined;
+          notify();
+          listeners.clear();
+        },
+      };
+    }
+
     const PACKAGE_ID = '@local/dsh-session-split';
     const TAB_TYPE_ID = '@local/dsh-session-split/native-v11';
     const TAB_KIND = 'sessionsplitv11';
@@ -77,10 +212,10 @@ window.__ModuleLoader__.load({
     }
 
     function useSessionReference(sessions, sessionId) {
-      const [state, setState] = React.useState({ id: '', reference: null, error: '' });
+      const [state, setState] = React.useState({ id: '', reference: null, ready: false, error: '' });
       React.useEffect(() => {
         if (!sessionId) {
-          setState({ id: '', reference: null, error: '' });
+          setState({ id: '', reference: null, ready: false, error: '' });
           return undefined;
         }
         let active = true;
@@ -89,12 +224,14 @@ window.__ModuleLoader__.load({
         const messageFor = (cause) => cause && typeof cause.message === 'string' ? cause.message : String(cause);
         try {
           reference = sessions.retain(sessionId, { source: 'sidebarChat', signal: controller.signal });
-          setState({ id: sessionId, reference, error: '' });
-          reference.ready.catch((cause) => {
-            if (active) setState({ id: sessionId, reference, error: messageFor(cause) });
+          setState({ id: sessionId, reference, ready: false, error: '' });
+          reference.ready.then(() => {
+            if (active) setState({ id: sessionId, reference, ready: true, error: '' });
+          }, (cause) => {
+            if (active) setState({ id: sessionId, reference, ready: false, error: messageFor(cause) });
           });
         } catch (cause) {
-          setState({ id: sessionId, reference: null, error: messageFor(cause) });
+          setState({ id: sessionId, reference: null, ready: false, error: messageFor(cause) });
         }
         return () => {
           active = false;
@@ -102,7 +239,7 @@ window.__ModuleLoader__.load({
           if (reference) reference.release();
         };
       }, [sessions, sessionId]);
-      return state.id === sessionId ? state : { id: sessionId, reference: null, error: '' };
+      return state.id === sessionId ? state : { id: sessionId, reference: null, ready: false, error: '' };
     }
 
     function titleFor(address, sessions, t) {
@@ -122,6 +259,14 @@ window.__ModuleLoader__.load({
 
     function ConversationSlotPanel(props) {
       const { sessionId, useSession, useConversation, useSessions, renderFactorySlot } = props;
+      const { completionRead, targetSessionId, targetVisible, targetReady } = props;
+      // A committed, successfully opened body counts as viewed, not a retained
+      // hidden tab or its title. Keeping this effect inside the render boundary
+      // also prevents an initially crashing conversation from acknowledging it.
+      React.useLayoutEffect(() => {
+        if (!targetReady || !targetVisible || !targetSessionId) return undefined;
+        return completionRead.retainVisible(targetSessionId);
+      }, [completionRead, targetSessionId, targetReady, targetVisible]);
       const session = useSession((value) => value);
       const shellPhase = useConversation((value) => value).activeTargets.size > 0
         || !session.blank && !session.awaitingFirstTurn || session.running
@@ -155,7 +300,7 @@ window.__ModuleLoader__.load({
       const { sessions, useTabInfo, SessionProvider, t } = props;
       const { tab } = useTabInfo();
       const sessionId = tab.navigation?.params?.targetSessionId || parseSessionAddress(tab.contentId);
-      const { reference, error } = useSessionReference(sessions, sessionId);
+      const { reference, ready, error } = useSessionReference(sessions, sessionId);
       return h('div', { className: 'dss-root', 'data-session-split': tab.contentId },
         h(LocalStyles),
         error ? h('div', { className: 'dss-state dss-error', role: 'alert' }, `${t('openFailed')}: ${error}`) : null,
@@ -163,7 +308,10 @@ window.__ModuleLoader__.load({
         !reference ? null : h(ConversationBoundary, null,
           h(SessionProvider, {
             session: reference,
-            children: h(ConversationSlotPanel, { ...props }),
+            children: h(ConversationSlotPanel, {
+              ...props, targetSessionId: sessionId,
+              targetVisible: tab.visible === true, targetReady: ready && !error,
+            }),
           }),
         ),
       );
@@ -232,11 +380,19 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots', 'sessions', 'locale', 'sidebarRight'],
+      inject: ['slots', 'sessions', 'locale', 'sidebarRight', 'uiSession'],
       apply(ctx) {
         return ctx.effect(() => {
           const locale = ctx.get('locale');
           const t = locale.bind(LOCALE_NS);
+          let completionRead;
+          const disposeCompletion = ctx.effect(() => {
+            completionRead = createCompletionReadBridge(
+              ctx.get('uiSession')?.sessionStatus,
+              (error) => console.error('[session-split] completion listener failed', error),
+            );
+            return () => completionRead.dispose();
+          }, 'session-split completion read compatibility');
           const disposers = [
             locale.register(LOCALE_NS, 'en', EN),
             locale.register(LOCALE_NS, 'zh', ZH),
@@ -263,7 +419,7 @@ window.__ModuleLoader__.load({
                 children: {
                   'sessionSplit.conversation': { kind: 'single', scope: 'session' },
                 },
-                inject: () => ({ sessions: ctx.sessions }),
+                inject: () => ({ sessions: ctx.sessions, completionRead }),
               }, SessionSplitTab)));
               localDisposers.push(ctx.slots.inject('sidebar.right.pane.tab.title', () => ctx.slots.register({
                 name: 'sidebar.right.pane.tab.title',
@@ -272,7 +428,7 @@ window.__ModuleLoader__.load({
               }, SessionSplitTitle)));
               localDisposers.push(ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({
                 name: 'sidebar.workspaces.session.menu.item',
-                id: 'session-split-open-right-v11',
+                id: 'session-split-open-right-v11-read-v201',
                 order: 100,
                 label: () => t('openRight'),
                 locale: LOCALE_NS,
@@ -292,6 +448,7 @@ window.__ModuleLoader__.load({
           });
           return async () => {
             await seat.dispose();
+            await disposeCompletion();
             for (const dispose of disposers.reverse()) {
               try { dispose(); } catch {}
             }
